@@ -22,6 +22,10 @@ internal final class RttCommand: Sendable {
         RttCommand(promise: channel?.eventLoop.makePromise(of: TimeInterval.self))
     }
 
+    static func make(on eventLoop: EventLoop) -> RttCommand {
+        RttCommand(promise: eventLoop.makePromise(of: TimeInterval.self))
+    }
+
     private init(promise: EventLoopPromise<TimeInterval>?) {
         self.promise = promise
     }
@@ -31,6 +35,13 @@ internal final class RttCommand: Sendable {
         let nanoTime = now.uptimeNanoseconds - startTime.uptimeNanoseconds
         let rtt = TimeInterval(nanoTime) / 1_000_000_000  // Convert nanos to seconds
         promise?.succeed(rtt)
+    }
+
+    /// Fails a ping that will never get its PONG. An `EventLoopPromise` dropped without being
+    /// completed traps in debug builds ("leaking promise"), so every queued ping must end here or
+    /// in ``setRoundTripTime()``.
+    func fail(_ error: Error) {
+        promise?.fail(error)
     }
 
     func getRoundTripTime() async throws -> TimeInterval {

@@ -22,6 +22,15 @@ internal final class ConcurrentQueue<T: Sendable>: Sendable {
         }
     }
 
+    /// Removes and returns every element, oldest first.
+    func drain() -> [T] {
+        elements.withLockedValue { array in
+            let all = array
+            array.removeAll()
+            return all
+        }
+    }
+
     func dequeue() -> T? {
         elements.withLockedValue { array in
             guard !array.isEmpty else { return nil }

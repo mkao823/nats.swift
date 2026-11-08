@@ -112,7 +112,13 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         CheckedContinuation<Void, Error>?
     >(nil)
 
-    private let pingQueue = ConcurrentQueue<RttCommand>()
+    internal let pingQueue = ConcurrentQueue<RttCommand>()
+
+    deinit {
+        // Last line of defence: a handler released with pings still queued (the client dropped
+        // without close(), say) would otherwise trap in debug builds on the leaked promises.
+        failPendingPings()
+    }
     private let _batchBuffer = NIOLockedValueBox<BatchBuffer?>(nil)
     private(set) var batchBuffer: BatchBuffer? {
         get { _batchBuffer.withLockedValue { $0 } }
@@ -423,6 +429,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         // would trip the ">2" disconnect on the very first ping of the new, healthy connection --
         // flapping connected/disconnected forever.
         self.outstandingPings.store(0, ordering: AtomicStoreOrdering.relaxed)
+        self.failPendingPings()
         guard let channel = self.channel else {
             throw NatsError.ClientError.internalError("empty channel")
         }
@@ -840,6 +847,15 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
     /// On a permanent close, end every open subscription so a reader suspended in `nextMessage()`
     /// is resumed with `nil` (end-of-stream) rather than hanging forever. Snapshot + clear under the
     /// lock, then `complete()` each OUTSIDE the lock (it resumes reader continuations).
+    /// Fails every ping still waiting for a PONG. Called whenever the connection that carried them
+    /// goes away (disconnect, close, suspend, reconnect, deinit): their PONGs can no longer arrive,
+    /// and a dropped, uncompleted `EventLoopPromise` traps in debug builds ("leaking promise").
+    internal func failPendingPings(_ error: Error = NatsError.ClientError.connectionClosed) {
+        for ping in self.pingQueue.drain() {
+            ping.fail(error)
+        }
+    }
+
     private func completeAllSubscriptions() {
         let subs = self.subscriptions.withLockedValue { subs -> [NatsSubscription] in
             let all = Array(subs.values)
@@ -856,6 +872,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
             self.state.withLockedValue { $0 = .closed }
             self.pingTask?.cancel()
             self.batchBuffer = nil
+            self.failPendingPings()
             self.completeAllSubscriptions()
             self.fire(.closed)
             return
@@ -878,6 +895,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         }
 
         self.batchBuffer = nil
+        self.failPendingPings()
         self.completeAllSubscriptions()
         self.fire(.closed)
     }
@@ -915,6 +933,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         }
 
         try await promise.futureResult.get()
+        self.failPendingPings()
         self.fire(.suspended)
     }
 
@@ -941,6 +960,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         let pingsOut = self.outstandingPings.wrappingIncrementThenLoad(
             ordering: AtomicUpdateOrdering.relaxed)
         if pingsOut > 2 {
+            rttCommand?.fail(NatsError.ClientError.connectionClosed)
             handleDisconnect()
             return
         }
@@ -951,6 +971,9 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
             logger.debug("sent ping: \(pingsOut)")
         } catch {
             logger.error("Unable to send ping: \(error)")
+            // Nothing went out, so no PONG will answer it. The queue is FIFO, so fail everything
+            // queued: an older ping left in front of a newer one would take the newer one's PONG.
+            self.failPendingPings(error)
         }
 
     }
@@ -996,6 +1019,9 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         }) {
             continuation.resume(throwing: errorToUse)
         }
+
+        // The channel is gone, so no PONG for a queued ping can arrive any more.
+        failPendingPings()
 
         let shouldHandleDisconnect = state.withLockedValue { $0 == .connected }
         if shouldHandleDisconnect {
